@@ -1,0 +1,284 @@
+networks:
+  sof-elk-net:
+    driver: bridge
+
+services:
+  sof-elk-init:
+    container_name: sof-elk-init
+    image: alpine/git:latest
+    restart: 'no'
+    user: '0:0'
+    entrypoint:
+      - /bin/sh
+      - '-c'
+      - |
+        set -e
+
+        echo "[sof-elk-init] Creating directory structure..."
+
+        mkdir -p /host/sof-elk
+        mkdir -p /host/filebeat
+        mkdir -p /host/filebeat-data
+        mkdir -p /host/geoip
+
+        mkdir -p /host/ingest/aws
+        mkdir -p /host/ingest/azure
+        mkdir -p /host/ingest/gcp
+        mkdir -p /host/ingest/gws
+        mkdir -p /host/ingest/hayabusa
+        mkdir -p /host/ingest/httpd
+        mkdir -p /host/ingest/kape
+        mkdir -p /host/ingest/kubernetes
+        mkdir -p /host/ingest/microsoft365
+        mkdir -p /host/ingest/nfarch
+        mkdir -p /host/ingest/passivedns
+        mkdir -p /host/ingest/plaso
+        mkdir -p /host/ingest/syslog
+        mkdir -p /host/ingest/volatility
+        mkdir -p /host/ingest/zeek
+
+        mkdir -p /host/elasticsearch-data
+        mkdir -p /host/logstash-data
+        mkdir -p /host/kibana-data
+
+        if [ ! -d /host/sof-elk/.git ]; then
+          echo "[sof-elk-init] Cloning SOF-ELK repo..."
+          rm -rf /host/sof-elk
+          git clone https://github.com/philhagen/sof-elk.git /host/sof-elk
+        else
+          echo "[sof-elk-init] SOF-ELK repo already exists. Fetching updates..."
+          cd /host/sof-elk
+          git fetch --all || true
+        fi
+
+        cd /host/sof-elk
+
+        echo "[sof-elk-init] Checking out public/v20251010..."
+        git checkout public/v20251010 || git checkout main
+
+        echo "[sof-elk-init] Writing Filebeat config..."
+
+        cat > /host/filebeat/filebeat.yml <<'EOF'
+        filebeat.inputs:
+          - type: filestream
+            id: sof-elk-filesystem-ingest
+            enabled: true
+            prospector.scanner.recursive_glob: true
+            paths:
+              - /logstash/aws/**
+              - /logstash/azure/**
+              - /logstash/gcp/**
+              - /logstash/gws/**
+              - /logstash/hayabusa/**
+              - /logstash/httpd/**
+              - /logstash/kape/**
+              - /logstash/kubernetes/**
+              - /logstash/microsoft365/**
+              - /logstash/nfarch/**
+              - /logstash/passivedns/**
+              - /logstash/plaso/**
+              - /logstash/syslog/**
+              - /logstash/volatility/**
+              - /logstash/zeek/**
+
+        output.logstash:
+          hosts: ["sof-elk-logstash:5044"]
+
+        logging.level: info
+        logging.to_files: false
+        logging.to_stderr: true
+
+        setup.ilm.enabled: false
+        EOF
+
+        chmod 0644 /host/filebeat/filebeat.yml
+
+        echo "[sof-elk-init] Setting ownership and write permissions for Elastic containers..."
+
+        chown -R 1000:0 /host/elasticsearch-data || true
+        chown -R 1000:0 /host/logstash-data || true
+        chown -R 1000:0 /host/kibana-data || true
+        chown -R 1000:0 /host/filebeat-data || true
+
+        chmod -R 0775 /host/elasticsearch-data || true
+        chmod -R 0775 /host/logstash-data || true
+        chmod -R 0775 /host/kibana-data || true
+        chmod -R 0775 /host/filebeat-data || true
+        chmod -R 0755 /host/geoip || true
+
+        echo "[sof-elk-init] Done."
+    volumes:
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk:/host
+
+  sof-elk-elasticsearch:
+    container_name: sof-elk-elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.5
+    depends_on:
+      sof-elk-init:
+        condition: service_completed_successfully
+    environment:
+      ES_JAVA_OPTS: '-Xms4g -Xmx4g'
+      bootstrap.memory_lock: 'false'
+      cluster.name: sof-elk
+      discovery.type: single-node
+      node.name: sof-elk-node-1
+      xpack.security.enabled: 'false'
+      xpack.security.enrollment.enabled: 'false'
+    healthcheck:
+      interval: 30s
+      retries: 20
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:9200 >/dev/null || exit 1
+      timeout: 10s
+    networks:
+      - sof-elk-net
+    ports:
+      - '9200:9200'
+      - '9300:9300'
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        hard: -1
+        soft: -1
+      nofile:
+        hard: 65535
+        soft: 65535
+    volumes:
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/elasticsearch-data:/usr/share/elasticsearch/data
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+
+  sof-elk-kibana:
+    container_name: sof-elk-kibana
+    image: docker.elastic.co/kibana/kibana:9.1.5
+    depends_on:
+      sof-elk-elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://sof-elk-elasticsearch:9200
+      SERVER_HOST: 0.0.0.0
+      SERVER_NAME: sof-elk-kibana
+      TELEMETRY_ENABLED: 'false'
+      XPACK_SECURITY_ENABLED: 'false'
+    healthcheck:
+      interval: 30s
+      retries: 30
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:5601/api/status >/dev/null || exit 1
+      timeout: 10s
+    networks:
+      - sof-elk-net
+    ports:
+      - '5601:5601'
+    restart: unless-stopped
+    volumes:
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/kibana-data:/usr/share/kibana/data
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+
+  sof-elk-logstash:
+    container_name: sof-elk-logstash
+    image: docker.elastic.co/logstash/logstash:9.1.5
+    depends_on:
+      sof-elk-elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://sof-elk-elasticsearch:9200
+      LS_JAVA_OPTS: '-Xms2g -Xmx2g'
+      XPACK_MONITORING_ENABLED: 'false'
+    command:
+      - /bin/bash
+      - '-c'
+      - |
+        set -e
+
+        echo "[sof-elk-logstash] Verifying data directory permissions..."
+
+        if [ ! -w /usr/share/logstash/data ]; then
+          echo "[sof-elk-logstash] ERROR: /usr/share/logstash/data is not writable."
+          echo "[sof-elk-logstash] Check host path permissions:"
+          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/logstash-data"
+          exit 1
+        fi
+
+        echo "[sof-elk-logstash] Checking GeoIP database files..."
+
+        if [ ! -f /usr/local/share/GeoIP/GeoLite2-ASN.mmdb ]; then
+          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-ASN.mmdb"
+          echo "[sof-elk-logstash] Place GeoLite2-ASN.mmdb in:"
+          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-ASN.mmdb"
+        fi
+
+        if [ ! -f /usr/local/share/GeoIP/GeoLite2-City.mmdb ]; then
+          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-City.mmdb"
+          echo "[sof-elk-logstash] Place GeoLite2-City.mmdb in:"
+          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-City.mmdb"
+        fi
+
+        if [ ! -f /usr/local/share/GeoIP/GeoLite2-Country.mmdb ]; then
+          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-Country.mmdb"
+          echo "[sof-elk-logstash] Place GeoLite2-Country.mmdb in:"
+          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-Country.mmdb"
+        fi
+
+        echo "[sof-elk-logstash] Checking required Logstash plugins..."
+
+        PLUGIN_LIST="$(/usr/share/logstash/bin/logstash-plugin list || true)"
+
+        if ! echo "$PLUGIN_LIST" | grep -q '^logstash-input-relp$'; then
+          echo "[sof-elk-logstash] Installing missing plugin: logstash-input-relp"
+          /usr/share/logstash/bin/logstash-plugin install logstash-input-relp
+        else
+          echo "[sof-elk-logstash] Plugin already installed: logstash-input-relp"
+        fi
+
+        PLUGIN_LIST="$(/usr/share/logstash/bin/logstash-plugin list || true)"
+
+        if ! echo "$PLUGIN_LIST" | grep -q '^logstash-filter-json_encode$'; then
+          echo "[sof-elk-logstash] Installing missing plugin: logstash-filter-json_encode"
+          /usr/share/logstash/bin/logstash-plugin install logstash-filter-json_encode
+        else
+          echo "[sof-elk-logstash] Plugin already installed: logstash-filter-json_encode"
+        fi
+
+        echo "[sof-elk-logstash] Starting Logstash with SOF-ELK configfiles..."
+
+        if ! grep -R "5044" /usr/share/logstash/pipeline >/dev/null 2>&1; then
+          echo "[sof-elk-logstash] WARNING: No obvious Beats input on 5044 found in SOF-ELK pipeline configs."
+          echo "[sof-elk-logstash] If Filebeat cannot connect, you may need to add a beats input config."
+        fi
+
+        /usr/local/bin/docker-entrypoint \
+          logstash \
+          --path.settings /usr/share/logstash/config \
+          -f /usr/share/logstash/pipeline
+    networks:
+      - sof-elk-net
+    ports:
+      - '5044:5044'
+      - '9995:9995/udp'
+    restart: unless-stopped
+    volumes:
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk/configfiles:/usr/share/logstash/pipeline:ro
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/ingest:/logstash
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/logstash-data:/usr/share/logstash/data
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip:/usr/local/share/GeoIP:ro
+
+  sof-elk-filebeat:
+    container_name: sof-elk-filebeat
+    image: docker.elastic.co/beats/filebeat:9.1.5
+    user: root
+    depends_on:
+      - sof-elk-logstash
+    command:
+      - '--strict.perms=false'
+      - '-e'
+    networks:
+      - sof-elk-net
+    restart: unless-stopped
+    volumes:
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/ingest:/logstash:ro
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/filebeat-data:/usr/share/filebeat/data
