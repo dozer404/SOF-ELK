@@ -1,45 +1,128 @@
 networks:
   sof-elk-net:
     driver: bridge
-
 services:
+  sof-elk-elasticsearch:
+    container_name: sof-elk-elasticsearch
+    depends_on:
+      sof-elk-init:
+        condition: service_completed_successfully
+    environment:
+      ES_JAVA_OPTS: '-Xms4g -Xmx4g'
+      bootstrap.memory_lock: 'false'
+      cluster.name: sof-elk
+      discovery.type: single-node
+      node.name: sof-elk-node-1
+      xpack.security.enabled: 'false'
+      xpack.security.enrollment.enabled: 'false'
+    healthcheck:
+      interval: 30s
+      retries: 20
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:9200 >/dev/null || exit 1
+      timeout: 10s
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.5
+    networks:
+      - sof-elk-net
+    ports:
+      - '9200:9200'
+      - '9300:9300'
+    restart: unless-stopped
+    ulimits:
+      memlock:
+        hard: -1
+        soft: -1
+      nofile:
+        hard: 65535
+        soft: 65535
+    volumes:
+      - >-
+        /mnt/Stor0/ix-applications/sof-elk/elasticsearch-data:/usr/share/elasticsearch/data
+      - /mnt/Stor0/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+  sof-elk-filebeat:
+    command:
+      - '--strict.perms=false'
+      - '-e'
+    container_name: sof-elk-filebeat
+    depends_on:
+      - sof-elk-logstash
+    image: docker.elastic.co/beats/filebeat:9.1.5
+    networks:
+      - sof-elk-net
+    restart: unless-stopped
+    user: root
+    volumes:
+      - >-
+        /mnt/Stor0/ix-applications/sof-elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /mnt/Stor0/ix-applications/sof-elk/ingest:/logstash:ro
+      - /mnt/Stor0/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+      - >-
+        /mnt/Stor0/ix-applications/sof-elk/filebeat-data:/usr/share/filebeat/data
   sof-elk-init:
     container_name: sof-elk-init
-    image: alpine/git:latest
-    restart: 'no'
-    user: '0:0'
     entrypoint:
       - /bin/sh
       - '-c'
-      - |
+      - >
         set -e
+
+
+        echo "[sof-elk-init] Installing helper tools..."
+
+        apk add --no-cache curl gzip coreutils ca-certificates sed grep
+        >/dev/null
+
 
         echo "[sof-elk-init] Creating directory structure..."
 
+
         mkdir -p /host/sof-elk
+
         mkdir -p /host/filebeat
+
         mkdir -p /host/filebeat-data
+
         mkdir -p /host/geoip
 
+
         mkdir -p /host/ingest/aws
+
         mkdir -p /host/ingest/azure
+
         mkdir -p /host/ingest/gcp
+
         mkdir -p /host/ingest/gws
+
         mkdir -p /host/ingest/hayabusa
+
         mkdir -p /host/ingest/httpd
+
         mkdir -p /host/ingest/kape
+
         mkdir -p /host/ingest/kubernetes
+
         mkdir -p /host/ingest/microsoft365
+
         mkdir -p /host/ingest/nfarch
+
         mkdir -p /host/ingest/passivedns
+
         mkdir -p /host/ingest/plaso
+
         mkdir -p /host/ingest/syslog
+
         mkdir -p /host/ingest/volatility
+
         mkdir -p /host/ingest/zeek
 
+
         mkdir -p /host/elasticsearch-data
+
         mkdir -p /host/logstash-data
+
         mkdir -p /host/kibana-data
+
 
         if [ ! -d /host/sof-elk/.git ]; then
           echo "[sof-elk-init] Cloning SOF-ELK repo..."
@@ -51,14 +134,91 @@ services:
           git fetch --all || true
         fi
 
+
         cd /host/sof-elk
 
+
         echo "[sof-elk-init] Checking out public/v20251010..."
+
         git checkout public/v20251010 || git checkout main
+
+
+        echo "[sof-elk-init] Patching SOF-ELK Logstash configs for Docker
+        Elasticsearch hostname..."
+
+
+        grep -RIl "127.0.0.1:9200\|localhost:9200" /host/sof-elk/configfiles
+        /host/sof-elk/lib 2>/dev/null | while read -r file; do
+          echo "[sof-elk-init] Patching $$file"
+          sed -i \
+            -e 's#127\.0\.0\.1:9200#sof-elk-elasticsearch:9200#g' \
+            -e 's#localhost:9200#sof-elk-elasticsearch:9200#g' \
+            "$$file"
+        done
+
+
+        echo "[sof-elk-init] Downloading GeoIP databases..."
+
+
+        cd /host/geoip
+
+
+        download_gzip_mmdb() {
+          URL="$$1"
+          GZ_FILE="$$2"
+          MMDB_FILE="$$3"
+
+          if [ -s "$$MMDB_FILE" ]; then
+            echo "[sof-elk-init] $$MMDB_FILE already exists and is non-empty, skipping download."
+            return 0
+          fi
+
+          rm -f "$$GZ_FILE" "$$MMDB_FILE"
+
+          echo "[sof-elk-init] Downloading $$MMDB_FILE..."
+          curl -fSL "$$URL" -o "$$GZ_FILE"
+
+          if [ ! -s "$$GZ_FILE" ]; then
+            echo "[sof-elk-init] ERROR: Downloaded $$GZ_FILE is empty."
+            exit 1
+          fi
+
+          gzip -dc "$$GZ_FILE" > "$$MMDB_FILE"
+
+          if [ ! -s "$$MMDB_FILE" ]; then
+            echo "[sof-elk-init] ERROR: Extracted $$MMDB_FILE is empty."
+            exit 1
+          fi
+
+          echo "[sof-elk-init] $$MMDB_FILE ready ($$(du -h "$$MMDB_FILE" | cut -f1))"
+        }
+
+
+        download_gzip_mmdb \
+          "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz" \
+          "GeoLite2-City.mmdb.gz" \
+          "GeoLite2-City.mmdb"
+
+        download_gzip_mmdb \
+          "https://cdn.jsdelivr.net/npm/geolite2-country/GeoLite2-Country.mmdb.gz" \
+          "GeoLite2-Country.mmdb.gz" \
+          "GeoLite2-Country.mmdb"
+
+        download_gzip_mmdb \
+          "https://cdn.jsdelivr.net/npm/geolite2-asn/GeoLite2-ASN.mmdb.gz" \
+          "GeoLite2-ASN.mmdb.gz" \
+          "GeoLite2-ASN.mmdb"
+
+        download_gzip_mmdb \
+          "https://cdn.jsdelivr.net/npm/dbip-city-lite/dbip-city-lite.mmdb.gz" \
+          "dbip-city-lite.mmdb.gz" \
+          "dbip-city-lite.mmdb"
 
         echo "[sof-elk-init] Writing Filebeat config..."
 
+
         cat > /host/filebeat/filebeat.yml <<'EOF'
+
         filebeat.inputs:
           - type: filestream
             id: sof-elk-filesystem-ingest
@@ -85,72 +245,60 @@ services:
           hosts: ["sof-elk-logstash:5044"]
 
         logging.level: info
+
         logging.to_files: false
+
         logging.to_stderr: true
 
+
         setup.ilm.enabled: false
+
         EOF
+
 
         chmod 0644 /host/filebeat/filebeat.yml
 
-        echo "[sof-elk-init] Setting ownership and write permissions for Elastic containers..."
+
+        echo "[sof-elk-init] Setting ownership and write permissions for Elastic
+        containers..."
+
 
         chown -R 1000:0 /host/elasticsearch-data || true
+
         chown -R 1000:0 /host/logstash-data || true
+
         chown -R 1000:0 /host/kibana-data || true
+
         chown -R 1000:0 /host/filebeat-data || true
 
+
         chmod -R 0775 /host/elasticsearch-data || true
+
         chmod -R 0775 /host/logstash-data || true
+
         chmod -R 0775 /host/kibana-data || true
+
         chmod -R 0775 /host/filebeat-data || true
-        chmod -R 0755 /host/geoip || true
+
+
+        chmod 0755 /host/geoip || true
+
+        chmod 0644 /host/geoip/*.mmdb || true
+
+
+        echo "[sof-elk-init] GeoIP directory contents:"
+
+        ls -lah /host/geoip || true
+
 
         echo "[sof-elk-init] Done."
+    image: alpine/git:latest
+    restart: 'no'
+    user: '0:0'
     volumes:
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk:/host
-
-  sof-elk-elasticsearch:
-    container_name: sof-elk-elasticsearch
-    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.5
-    depends_on:
-      sof-elk-init:
-        condition: service_completed_successfully
-    environment:
-      ES_JAVA_OPTS: '-Xms4g -Xmx4g'
-      bootstrap.memory_lock: 'false'
-      cluster.name: sof-elk
-      discovery.type: single-node
-      node.name: sof-elk-node-1
-      xpack.security.enabled: 'false'
-      xpack.security.enrollment.enabled: 'false'
-    healthcheck:
-      interval: 30s
-      retries: 20
-      test:
-        - CMD-SHELL
-        - curl -fsS http://localhost:9200 >/dev/null || exit 1
-      timeout: 10s
-    networks:
-      - sof-elk-net
-    ports:
-      - '9200:9200'
-      - '9300:9300'
-    restart: unless-stopped
-    ulimits:
-      memlock:
-        hard: -1
-        soft: -1
-      nofile:
-        hard: 65535
-        soft: 65535
-    volumes:
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/elasticsearch-data:/usr/share/elasticsearch/data
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
-
+      - /mnt/Stor0/ix-applications/sof-elk:/host
   sof-elk-kibana:
     container_name: sof-elk-kibana
-    image: docker.elastic.co/kibana/kibana:9.1.5
     depends_on:
       sof-elk-elasticsearch:
         condition: service_healthy
@@ -167,118 +315,120 @@ services:
         - CMD-SHELL
         - curl -fsS http://localhost:5601/api/status >/dev/null || exit 1
       timeout: 10s
+    image: docker.elastic.co/kibana/kibana:9.1.5
     networks:
       - sof-elk-net
     ports:
       - '5601:5601'
     restart: unless-stopped
     volumes:
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/kibana-data:/usr/share/kibana/data
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
-
+      - /mnt/Stor0/ix-applications/sof-elk/kibana-data:/usr/share/kibana/data
+      - /mnt/Stor0/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
   sof-elk-logstash:
-    container_name: sof-elk-logstash
-    image: docker.elastic.co/logstash/logstash:9.1.5
-    depends_on:
-      sof-elk-elasticsearch:
-        condition: service_healthy
-    environment:
-      ELASTICSEARCH_HOSTS: http://sof-elk-elasticsearch:9200
-      LS_JAVA_OPTS: '-Xms2g -Xmx2g'
-      XPACK_MONITORING_ENABLED: 'false'
     command:
       - /bin/bash
       - '-c'
-      - |
+      - >
         set -e
 
+
         echo "[sof-elk-logstash] Verifying data directory permissions..."
+
 
         if [ ! -w /usr/share/logstash/data ]; then
           echo "[sof-elk-logstash] ERROR: /usr/share/logstash/data is not writable."
           echo "[sof-elk-logstash] Check host path permissions:"
-          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/logstash-data"
+          echo "  /mnt/Stor0/ix-applications/sof-elk/logstash-data"
           exit 1
         fi
 
+
         echo "[sof-elk-logstash] Checking GeoIP database files..."
 
-        if [ ! -f /usr/local/share/GeoIP/GeoLite2-ASN.mmdb ]; then
-          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-ASN.mmdb"
-          echo "[sof-elk-logstash] Place GeoLite2-ASN.mmdb in:"
-          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-ASN.mmdb"
+
+        if [ ! -s /usr/local/share/GeoIP/GeoLite2-ASN.mmdb ]; then
+          echo "[sof-elk-logstash] ERROR: Missing or empty /usr/local/share/GeoIP/GeoLite2-ASN.mmdb"
+          echo "[sof-elk-logstash] Check host path:"
+          echo "  /mnt/Stor0/ix-applications/sof-elk/geoip/GeoLite2-ASN.mmdb"
+          exit 1
         fi
 
-        if [ ! -f /usr/local/share/GeoIP/GeoLite2-City.mmdb ]; then
-          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-City.mmdb"
-          echo "[sof-elk-logstash] Place GeoLite2-City.mmdb in:"
-          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-City.mmdb"
+
+        if [ ! -s /usr/local/share/GeoIP/GeoLite2-City.mmdb ]; then
+          echo "[sof-elk-logstash] ERROR: Missing or empty /usr/local/share/GeoIP/GeoLite2-City.mmdb"
+          echo "[sof-elk-logstash] Check host path:"
+          echo "  /mnt/Stor0/ix-applications/sof-elk/geoip/GeoLite2-City.mmdb"
+          exit 1
         fi
 
-        if [ ! -f /usr/local/share/GeoIP/GeoLite2-Country.mmdb ]; then
-          echo "[sof-elk-logstash] WARNING: Missing /usr/local/share/GeoIP/GeoLite2-Country.mmdb"
-          echo "[sof-elk-logstash] Place GeoLite2-Country.mmdb in:"
-          echo "  /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip/GeoLite2-Country.mmdb"
+
+        if [ ! -s /usr/local/share/GeoIP/GeoLite2-Country.mmdb ]; then
+          echo "[sof-elk-logstash] ERROR: Missing or empty /usr/local/share/GeoIP/GeoLite2-Country.mmdb"
+          echo "[sof-elk-logstash] Check host path:"
+          echo "  /mnt/Stor0/ix-applications/sof-elk/geoip/GeoLite2-Country.mmdb"
+          exit 1
         fi
+
 
         echo "[sof-elk-logstash] Checking required Logstash plugins..."
 
-        PLUGIN_LIST="$(/usr/share/logstash/bin/logstash-plugin list || true)"
 
-        if ! echo "$PLUGIN_LIST" | grep -q '^logstash-input-relp$'; then
+        PLUGIN_LIST="$$(/usr/share/logstash/bin/logstash-plugin list || true)"
+
+
+        if ! echo "$$PLUGIN_LIST" | grep -q '^logstash-input-relp$'; then
           echo "[sof-elk-logstash] Installing missing plugin: logstash-input-relp"
           /usr/share/logstash/bin/logstash-plugin install logstash-input-relp
         else
           echo "[sof-elk-logstash] Plugin already installed: logstash-input-relp"
         fi
 
-        PLUGIN_LIST="$(/usr/share/logstash/bin/logstash-plugin list || true)"
 
-        if ! echo "$PLUGIN_LIST" | grep -q '^logstash-filter-json_encode$'; then
+        PLUGIN_LIST="$$(/usr/share/logstash/bin/logstash-plugin list || true)"
+
+
+        if ! echo "$$PLUGIN_LIST" | grep -q '^logstash-filter-json_encode$';
+        then
           echo "[sof-elk-logstash] Installing missing plugin: logstash-filter-json_encode"
           /usr/share/logstash/bin/logstash-plugin install logstash-filter-json_encode
         else
           echo "[sof-elk-logstash] Plugin already installed: logstash-filter-json_encode"
         fi
 
+
         echo "[sof-elk-logstash] Starting Logstash with SOF-ELK configfiles..."
+
 
         if ! grep -R "5044" /usr/share/logstash/pipeline >/dev/null 2>&1; then
           echo "[sof-elk-logstash] WARNING: No obvious Beats input on 5044 found in SOF-ELK pipeline configs."
           echo "[sof-elk-logstash] If Filebeat cannot connect, you may need to add a beats input config."
         fi
 
+
         /usr/local/bin/docker-entrypoint \
           logstash \
           --path.settings /usr/share/logstash/config \
           -f /usr/share/logstash/pipeline
+    container_name: sof-elk-logstash
+    depends_on:
+      sof-elk-elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://sof-elk-elasticsearch:9200
+      LS_JAVA_OPTS: '-Xms2g -Xmx2g -Xss8m'
+      XPACK_MONITORING_ENABLED: 'false'
+    image: docker.elastic.co/logstash/logstash:9.1.5
     networks:
       - sof-elk-net
     ports:
       - '5044:5044'
-      - '9995:9995/udp'
+      - 9995:9995/udp
     restart: unless-stopped
     volumes:
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk/configfiles:/usr/share/logstash/pipeline:ro
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/ingest:/logstash
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/logstash-data:/usr/share/logstash/data
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/geoip:/usr/local/share/GeoIP:ro
-
-  sof-elk-filebeat:
-    container_name: sof-elk-filebeat
-    image: docker.elastic.co/beats/filebeat:9.1.5
-    user: root
-    depends_on:
-      - sof-elk-logstash
-    command:
-      - '--strict.perms=false'
-      - '-e'
-    networks:
-      - sof-elk-net
-    restart: unless-stopped
-    volumes:
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/ingest:/logstash:ro
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
-      - /mnt/YOUR_DATASET_NAME/ix-applications/sof-elk/filebeat-data:/usr/share/filebeat/data
+      - /mnt/Stor0/ix-applications/sof-elk/sof-elk:/usr/local/sof-elk:ro
+      - >-
+        /mnt/Stor0/ix-applications/sof-elk/sof-elk/configfiles:/usr/share/logstash/pipeline:ro
+      - /mnt/Stor0/ix-applications/sof-elk/ingest:/logstash
+      - >-
+        /mnt/Stor0/ix-applications/sof-elk/logstash-data:/usr/share/logstash/data
+      - /mnt/Stor0/ix-applications/sof-elk/geoip:/usr/local/share/GeoIP:ro
